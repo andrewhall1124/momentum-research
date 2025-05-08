@@ -1,59 +1,53 @@
 import marimo
 
-__generated_with = "0.13.4"
+__generated_with = "0.13.6"
 app = marimo.App(width="medium", app_title="Momentum Research")
 
 
 @app.cell
 def _():
     import polars as pl
+    import polars_ds as pds
     import marimo as mo
     import datetime as dt
     import seaborn as sns
     import matplotlib.pyplot as plt
     import numpy as np
-    return dt, mo, np, pl, plt, sns
+    from great_tables import GT, md, html
+    return GT, dt, mo, np, pl, plt, sns
 
 
 @app.cell
 def _(dt, mo):
     start_date = mo.ui.date(label="Start Date", value=dt.date(1995, 1, 1))  # 1965-1-1
     end_date = mo.ui.date(label="End Date", value=dt.date(2024, 12, 31))  # 1989-12-31
+    window = mo.ui.number(label="Feature Window", value=230)
+    skip = mo.ui.number(label="Feature Skip", value=22)
 
     n_bins = mo.ui.number(start=2, stop=20, value=10, label="Number of Bins")
 
-    mo.vstack(items=[start_date, end_date, n_bins])
-    return end_date, n_bins, start_date
+    mo.vstack(items=[start_date, end_date, window, skip, n_bins])
+    return end_date, n_bins, skip, start_date, window
 
 
 @app.cell
-def _(end_date, pl, start_date):
-    data = (
-        pl.scan_parquet('data/data.parquet')
-        .filter(
-            pl.col('date').is_between(start_date.value, end_date.value)
-        )
-        .collect()
-    )
-    data.head(5)
+def _(pl):
+    data = pl.read_parquet('data/data.parquet')
     return (data,)
 
 
 @app.cell
-def _():
-    window = 230
-    skip = 22
-    return skip, window
-
-
-@app.cell
-def _(data, pl, skip, window):
+def _(data, end_date, pl, skip, start_date, window):
     features = (
-        data.with_columns(
+        data
+        .filter(
+            pl.col('date').is_between(start_date.value, end_date.value)
+        )
+        .with_columns(
             pl.col('ret')
             .log1p()
-            .rolling_sum(window_size=window)
-            .shift(skip)
+            .rolling_sum(window_size=window.value)
+            .shift(skip.value)
             .over('permno')
             .alias('momentum')
         )
@@ -113,6 +107,73 @@ def _(labels, pl, portfolios):
 
 
 @app.cell
+def _(labels, pl, portfolios):
+    p_labels = [f'P{i}' for i in range(10)]
+    label_mapping = {label: p_label for label, p_label in zip(labels, p_labels)}
+
+    summary = (
+        portfolios
+        .unpivot(index='date', variable_name='portfolio', value_name='ret')
+        .group_by('portfolio')
+        .agg(
+            pl.col('ret').mul(100).mean().alias('mean'),
+            pl.col('ret').mul(100).std().alias('stdev'),
+            # pds.ttest_1samp('ret', pop_mean=0, alternative='two-sided').alias('stats')
+        )
+        .with_columns(
+            pl.col('mean').mul(252),
+            pl.col('stdev').mul(pl.lit(252).sqrt())
+        )
+        .with_columns(
+            pl.col('mean').truediv(pl.col('stdev')).alias('sharpe')
+        )
+        .sort('portfolio')
+    )
+
+    table = (
+        summary
+        .drop('portfolio')
+        .rename({
+            'mean': 'Mean (%)',
+            'stdev': 'Std. Dev. (%)',
+            'sharpe': 'Sharpe'
+        })
+        .transpose(include_header=True, column_names=[*labels, 'Spread'], header_name='Portfolio')
+        .rename(label_mapping)
+    )
+    return p_labels, summary, table
+
+
+@app.cell
+def _(GT, p_labels, summary, table):
+    max_return = summary['mean'].max()
+    min_return = summary['mean'].min()
+    max_sharpe = summary['sharpe'].max()
+    min_sharpe = summary['sharpe'].min()
+
+    gt_tbl = (
+        GT(table)
+        .tab_header(title='Portfolios Summary (Annualized)')
+        .fmt_number(columns=[*p_labels, 'Spread'], decimals=2)
+        .data_color(
+            columns=[*p_labels],
+            palette=['red', 'white', 'green'],
+            rows=0,
+            domain=[min_return, max_return]
+        )
+        .data_color(
+            columns=[*p_labels],
+            palette=['red', 'white', 'green'],
+            rows=2,
+            domain=[min_sharpe, max_sharpe]
+        )
+    )
+
+    gt_tbl
+    return
+
+
+@app.cell
 def _(cummulative_returns, labels, n_bins, np, plt, portfolios, sns):
     sharpe = portfolios['spread'].mean() / portfolios['spread'].std() * np.sqrt(252)
 
@@ -125,7 +186,7 @@ def _(cummulative_returns, labels, n_bins, np, plt, portfolios, sns):
 
     sns.lineplot(cummulative_returns, x='date', y='spread', color='green', label='Spread')
 
-    plt.title(f"Spread Portfolio Backtest ({sharpe:.2f})")
+    plt.title(f"Backtest ({sharpe:.2f})")
 
     plt.xlabel(None)
     plt.ylabel("Cummulative Sum Returns (%)")
